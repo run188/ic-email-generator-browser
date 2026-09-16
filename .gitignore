@@ -1,0 +1,20 @@
+# Local runtime data and personal generated results
+last-run-added-emails.json
+
+# Coordinator runtime state
+coordinator/*.db
+coordinator/*.db-*
+coordinator/*.pid
+coordinator/__pycache__/
+
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>iCloud 隐私邮箱助手（单浏览器版）</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <h1>隐私邮箱助手</h1>
+          <p id="pageStatus">正在检测页面…</p>
+        </div>
+        <button id="scanPage" class="icon-button" type="button" title="重新检测页面">检测</button>
+      </header>
+
+      <section class="shared-head">
+        <h2>当前浏览器</h2>
+        <span class="coordinator-status">单浏览器模式</span>
+      </section>
+
+      <section class="controls">
+        <label class="switch-row">
+          <span>运行开关</span>
+          <input id="runSwitch" type="checkbox" />
+        </label>
+        <label><span>创建数量</span><input id="count" type="number" min="1" max="50" value="20" /></label>
+        <label><span>标签起始数字</span><input id="startLabel" type="number" min="0" value="1" /></label>
+        <label><span>每轮间隔（秒）</span><input id="delaySeconds" type="number" min="0" max="300" step="0.1" value="1.2" /></label>
+        <button id="saveSettings" class="secondary settings-save" type="button">保存配置</button>
+      </section>
+
+      <section class="actions">
+        <button id="start" class="primary" type="button" disabled>开始</button>
+        <button id="stop" class="secondary" type="button" disabled>停止</button>
+      </section>
+
+      <section class="progress-area">
+        <div class="progress-row"><span id="progressText">0 / 20</span><span id="countText">列表数量：未知</span></div>
+        <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+        <p id="message" class="message">等待开始</p>
+      </section>
+
+      <section class="results-head">
+        <h2>本批次</h2>
+        <div class="inline-actions"><button id="copyCurrent" class="secondary" type="button">复制</button><button id="clearCurrent" class="secondary" type="button">清空</button></div>
+      </section>
+      <textarea id="results" class="results" readonly spellcheck="false"></textarea>
+
+      <section class="history-head"><h2>本浏览器历史</h2><button id="clearHistory" class="secondary" type="button">清空历史</button></section>
+      <div id="history" class="history"></div>
+    </main>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
