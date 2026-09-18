@@ -4,10 +4,14 @@
   }
   window.__hmeSidebarAssistantLoaded = true;
 
-  const EMAIL_RE = /[A-Z0-9._%+-]+@icloud\.com/gi;
+  // 只用于“找地址”的宽松邮箱匹配：页面上出现的所有邮箱都要能看到，
+  // 不能只匹配 @icloud.com，否则转发邮箱/账号邮箱会被漏掉而造成误判。
+  const EMAIL_ANY_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
   const DEFAULT_DELAY_MS = 1200;
   const DEFAULT_TIMEOUT_MS = 90000;
   const HEARTBEAT_INTERVAL_MS = 30000;
+  // 新地址出现后，若同时出现多个“新地址”，先宽容这段时间再判定为异常
+  const AMBIGUOUS_GRACE_MS = 5000;
 
   class LimitReachedError extends Error {
     constructor(message) {
@@ -123,7 +127,18 @@
       if (state.stopRequested) {
         emit("任务已停止", "stopped");
       } else {
-        emit(`完成，本批次新增 ${state.results.length} 个`, "complete");
+        // 批次结束自检：结果里出现重复 = 识别出错的强烈信号，必须显式告警而不是静默保存
+        const duplicates = state.results.filter((email, index) => state.results.indexOf(email) !== index);
+        if (duplicates.length) {
+          emit(
+            `完成，但 ${state.results.length} 个结果里有 ${duplicates.length} 个重复（如 ${duplicates[0]}），疑似识别错误，请核对后再使用`,
+            "error"
+          );
+        } else if (state.results.length !== total) {
+          emit(`完成，本批次新增 ${state.results.length} 个，少于预期的 ${total} 个，请核对`, "error");
+        } else {
+          emit(`完成，本批次新增 ${state.results.length} 个`, "complete");
+        }
       }
     } catch (error) {
       state.running = false;
@@ -136,13 +151,17 @@
   }
 
   async function createOne(label) {
+    // 点击“创建新地址”之前先给页面上的邮箱拍一次快照，
+    // 之后只有“快照里没有的新地址”才可能是本次生成的地址。
+    const before = collectEmails();
+
     const plusButton = await waitFor(() => findCreateNewButton(), "没有找到“创建新地址”按钮");
     clickElement(plusButton);
 
-    const candidateEmail = await waitFor(() => {
-      const emails = getVisibleIcloudEmails();
-      return emails.length === 1 ? emails[0] : "";
-    }, "没有读取到新生成的邮箱地址");
+    const candidateEmail = await readNewCandidate(before);
+    if (blockedEmails().has(candidateEmail)) {
+      throw new Error(`本次读取到的新地址与转发邮箱/账号邮箱相同（${candidateEmail}），已停止以免记错数据`);
+    }
 
     const labelInput = await waitFor(() => findLabelInput(), "没有找到标签输入框");
     setInputValue(labelInput, label);
@@ -153,10 +172,7 @@
     }, "创建按钮没有变为可点击");
     clickElement(createButton);
 
-    await waitFor(() => {
-      const text = pageText();
-      return text.includes(candidateEmail) && isDetailPage(candidateEmail);
-    }, "提交后没有进入已创建详情页");
+    await confirmCreatedAddress(candidateEmail);
 
     return candidateEmail;
   }
@@ -187,7 +203,7 @@
   function scanPage() {
     const text = pageText();
     const countMatch = text.match(/(\d+)\s*个使用中/);
-    const emails = getVisibleIcloudEmails();
+    const currentAddress = readVisibleAddress();
     const accountEmail = getLoggedInAccountEmail();
     let page = "unknown";
 
@@ -197,7 +213,7 @@
       page = "list";
     } else if (text.includes("创建新地址")) {
       page = "create";
-    } else if (emails.length === 1 && isDetailPage(emails[0])) {
+    } else if (currentAddress && isDetailPageShape()) {
       page = "detail";
     } else if (location.pathname.includes("/section/privacy")) {
       page = "privacy";
@@ -209,7 +225,7 @@
       count: countMatch ? Number(countMatch[1]) : null,
       accountEmail,
       forwardEmail: getSelectedForwardEmail(),
-      currentEmail: emails.length === 1 ? emails[0] : "",
+      currentEmail: currentAddress,
       running: state.running,
       results: [...state.results],
       errors: [...state.errors]
@@ -303,14 +319,14 @@
       .sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y)[0] || null;
   }
 
-  function isDetailPage(email) {
+  function isDetailPageShape() {
     const textareas = Array.from(document.querySelectorAll("textarea")).filter(isVisible);
     const hasBottomRightSubmit = visibleButtons().some((button) => {
       const rect = button.getBoundingClientRect();
       return rect.width >= 120 && rect.height <= 60 && rect.y > 650 && rect.x > window.innerWidth / 2;
     });
 
-    return pageText().includes(email) && textareas.length === 0 && !hasBottomRightSubmit;
+    return textareas.length === 0 && !hasBottomRightSubmit;
   }
 
   function isLoginPage() {
@@ -338,8 +354,157 @@
     return Array.from(document.querySelectorAll("button")).filter(isVisible);
   }
 
-  function getVisibleIcloudEmails() {
-    return Array.from(new Set((pageText().match(EMAIL_RE) || []).map((email) => email.toLowerCase())));
+  // 收集页面上所有邮箱：innerText + 所有 input/textarea 的 value。
+  // 关键点：innerText 不含输入框的值，而新生成的地址正是渲染在输入框里的，
+  // 少了这一步页面上就只剩“转发邮箱”一个可见地址，整批都会被记成它。
+  function collectEmails() {
+    const parts = [pageText()];
+    Array.from(document.querySelectorAll("input, textarea")).forEach((element) => {
+      const value = element.value || element.getAttribute("value") || "";
+      if (value) {
+        parts.push(value);
+      }
+    });
+    return new Set((parts.join("\n").match(EMAIL_ANY_RE) || []).map((email) => email.toLowerCase()));
+  }
+
+  // “转发到”（forwardToEmail）单选组里的地址全是别人的地址，绝不能当成新生成的地址
+  function getForwardOptionEmails() {
+    const found = new Set();
+    Array.from(document.querySelectorAll('input[type="radio"]')).forEach((input) => {
+      const value = normalize(input.value).toLowerCase();
+      if (value.includes("@")) {
+        found.add(value);
+      }
+
+      const label = input.closest("label") || input.labels?.[0] || input.parentElement;
+      const text = normalize(label?.textContent || "");
+      if (text.length <= 200) {
+        (text.match(EMAIL_ANY_RE) || []).forEach((email) => found.add(email.toLowerCase()));
+      }
+    });
+    return found;
+  }
+
+  // 绝不可能等于本次生成地址的集合：账号邮箱、当前转发的目标邮箱、转发候选、本批已收集的结果
+  function blockedEmails() {
+    return new Set(
+      [state.accountEmail, state.forwardEmail, ...getForwardOptionEmails(), ...state.results]
+        .filter(Boolean)
+        .map((email) => String(email).toLowerCase())
+    );
+  }
+
+  // 只在“同时出现多个新地址”时用来排除干扰：读含“转发/forward”字样的小块文本里的地址。
+  // 只在候选多于一个时参与筛选，因此不会把唯一候选误排除。
+  function getForwardContextEmails() {
+    const found = new Set();
+    Array.from(document.querySelectorAll("label, li, p, span, div")).forEach((element) => {
+      if (element.children.length > 3 || !isVisible(element)) {
+        return;
+      }
+      const text = normalize(element.textContent);
+      if (!text || text.length > 200) {
+        return;
+      }
+      if (!text.includes("转发") && !/forward/i.test(text)) {
+        return;
+      }
+      (text.match(EMAIL_ANY_RE) || []).forEach((email) => found.add(email.toLowerCase()));
+    });
+    return found;
+  }
+
+  // 当前页面上唯一一个“不是转发邮箱/账号邮箱/历史结果”的地址，即本页正在展示的地址
+  function readVisibleAddress() {
+    const blocked = blockedEmails();
+    const emails = Array.from(collectEmails()).filter((email) => !blocked.has(email));
+    if (emails.length === 1) {
+      return emails[0];
+    }
+
+    const forwardContext = getForwardContextEmails();
+    const narrowed = emails.filter((email) => !forwardContext.has(email));
+    return narrowed.length === 1 ? narrowed[0] : "";
+  }
+
+  // 找到“本次新出现的地址”：与点击前的快照求差，并剔除转发邮箱/账号邮箱/历史结果
+  async function readNewCandidate(before) {
+    const startedAt = Date.now();
+    let ambiguousSince = 0;
+    let lastSeen = "";
+
+    while (Date.now() - startedAt < DEFAULT_TIMEOUT_MS) {
+      throwIfCreationLimitReached();
+      if (state.stopRequested && !state.running) {
+        throw new Error("任务已停止");
+      }
+
+      const blocked = blockedEmails();
+      const fresh = Array.from(collectEmails()).filter(
+        (email) => !before.has(email) && !blocked.has(email)
+      );
+      lastSeen = fresh.join("、");
+
+      if (fresh.length === 1) {
+        return fresh[0];
+      }
+
+      if (fresh.length > 1) {
+        const forwardContext = getForwardContextEmails();
+        const narrowed = fresh.filter((email) => !forwardContext.has(email));
+        if (narrowed.length === 1) {
+          return narrowed[0];
+        }
+
+        ambiguousSince = ambiguousSince || Date.now();
+        if (Date.now() - ambiguousSince > AMBIGUOUS_GRACE_MS) {
+          throw new Error(
+            `创建页同时出现 ${fresh.length} 个新地址（${fresh.join("、")}），无法确认本次生成的地址，已停止以免记错数据`
+          );
+        }
+      } else {
+        ambiguousSince = 0;
+      }
+
+      await sleep(200);
+    }
+
+    throw new Error(`没有读取到新生成的邮箱地址（本次新出现的地址：${lastSeen || "无"}）`);
+  }
+
+  // 提交后独立核对：详情页实际展示的地址必须等于本次生成的地址，否则失败退出而不是记错
+  async function confirmCreatedAddress(candidateEmail) {
+    const startedAt = Date.now();
+    let lastSeen = "";
+    let mismatchCount = 0;
+
+    while (Date.now() - startedAt < DEFAULT_TIMEOUT_MS) {
+      throwIfCreationLimitReached();
+      if (state.stopRequested && !state.running) {
+        throw new Error("任务已停止");
+      }
+
+      if (isDetailPageShape()) {
+        const shown = readVisibleAddress();
+        if (shown === candidateEmail) {
+          return;
+        }
+        if (shown) {
+          lastSeen = shown;
+          mismatchCount += 1;
+          if (mismatchCount >= 3) {
+            throw new Error(
+              `详情页展示的地址（${shown}）与本次生成的地址（${candidateEmail}）不一致，已停止以免记错数据`
+            );
+          }
+        }
+      }
+
+      await sleep(300);
+    }
+
+    throw new Error(`提交后没有进入已创建详情页（最后读到的地址：${lastSeen || "无"}）`);
   }
 
   function getLoggedInAccountEmail() {
